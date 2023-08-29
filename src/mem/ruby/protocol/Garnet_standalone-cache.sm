@@ -1,0 +1,265 @@
+/*
+ * Copyright (c) 2009 Advanced Micro Devices, Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met: redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer;
+ * redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution;
+ * neither the name of the copyright holders nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ *
+ * Authors: Brad Beckmann
+ *          Tushar Krishna
+ */
+
+
+machine(MachineType:L1Cache, "Garnet_standalone L1 Cache")
+    : Sequencer * sequencer;
+      Cycles issue_latency := 2;
+
+      // NETWORK BUFFERS
+      MessageBuffer * requestOut, network="To", virtual_network="0", vnet_type = "request";
+      MessageBuffer * requestIn, network="From", virtual_network="0", vnet_type = "request";
+      MessageBuffer * responseOut, network="To", virtual_network="1", vnet_type = "response";
+      MessageBuffer * responseIn, network="From", virtual_network="1", vnet_type = "response";
+      MessageBuffer * mandatoryQueue;
+{
+  // STATES
+  state_declaration(State, desc="Cache states", default="L1Cache_State_I") {
+    I,  AccessPermission:Invalid, desc="Not Present/Invalid";
+  }
+
+  // EVENTS
+  enumeration(Event, desc="Cache events") {
+    // From processor
+    LoadRequest,    desc="";
+    StoreRequest,    desc="";
+    LoadRequestArrived,    desc="";
+    StoreRequestArrived,    desc="";
+    LoadResponseArrived, desc="";
+  }
+
+  // STRUCTURE DEFINITIONS
+  DataBlock dummyData;
+
+  // CacheEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,        desc="cache state";
+    DataBlock DataBlk,       desc="Data in the block";
+  }
+
+  // FUNCTIONS
+  Tick clockEdge();
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+  MachineID mapAddressToL1Cache(Addr addr);
+
+  Event mandatory_request_type_to_event(RubyRequestType type) {
+    if (type == RubyRequestType:LD) {
+      return Event:LoadRequest;
+    } else if (type ==RubyRequestType:ST) {
+      return Event:StoreRequest;
+    } else {
+      error("Invalid RubyRequestType");
+    }
+  }
+  
+  Event requestIn_request_type_to_event(CoherenceRequestType type) {
+    if (type == CoherenceRequestType:LD) {
+      return Event:LoadRequestArrived;
+    } else if (type == CoherenceRequestType:ST) {
+      return Event:StoreRequestArrived;
+    } else {
+      error("Invalid RubyRequestType");
+    }
+  }
+
+  Event responseIn_request_type_to_event(CoherenceResponseType type) {
+    if (type == CoherenceResponseType:DATA) {
+      return Event:LoadResponseArrived;
+    } else {
+      error("Invalid RubyRequestType");
+    }
+  }
+
+  State getState(Entry cache_entry, Addr addr) {
+    return State:I;
+  }
+
+  void setState(Entry cache_entry, Addr addr, State state) {
+
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+  }
+
+  Entry getCacheEntry(Addr address), return_by_pointer="yes" {
+    return OOD;
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    error("Garnet_standalone does not support functional read.");
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    error("Garnet_standalone does not support functional write.");
+  }
+
+  // NETWORK PORTS
+
+  out_port(requestOut_out, RequestMsg, requestOut);
+  out_port(responseOut_out, ResponseMsg, responseOut);
+  
+  in_port(responseIn_in, ResponseMsg, responseIn, desc="...", rank = 0) {
+    if (responseIn_in.isReady(clockEdge())) {
+      peek(responseIn_in, ResponseMsg) {
+        trigger(responseIn_request_type_to_event(in_msg.Type),
+                in_msg.addr, getCacheEntry(in_msg.addr));
+      }
+    }
+  }
+
+  in_port(requestIn_in, RequestMsg, requestIn, desc="...", rank = 1) {
+    if (requestIn_in.isReady(clockEdge())) {
+      peek(requestIn_in, RequestMsg) {
+        trigger(requestIn_request_type_to_event(in_msg.Type),
+                in_msg.addr, getCacheEntry(in_msg.addr));
+      }
+    }
+  }
+  
+  // Mandatory Queue
+  in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="...", rank = 2) {
+    if (mandatoryQueue_in.isReady(clockEdge())) {
+      peek(mandatoryQueue_in, RubyRequest) {
+        trigger(mandatory_request_type_to_event(in_msg.Type),
+                in_msg.LineAddress, getCacheEntry(in_msg.LineAddress));
+      }
+    }
+  }
+  
+
+  // ACTIONS
+
+  // The destination directory of the packets is embedded in the address
+  // map_Address_to_Directory is used to retrieve it.
+
+  action(issueLoadRequest, "a", desc="") {
+      peek(mandatoryQueue_in, RubyRequest) {
+          enqueue(requestOut_out, RequestMsg, issue_latency) {
+              out_msg.addr := address;
+              out_msg.Type := CoherenceRequestType:LD;
+              out_msg.Requestor := machineID;
+              out_msg.Destination.add(mapAddressToL1Cache(address));
+              out_msg.MessageSize := MessageSizeType:Control;
+              out_msg.attackMessage := in_msg.attackMessage;
+              out_msg.req_enqueue_time := in_msg.req_enqueue_time;
+              DPRINTF(Vanilla, "issueLoadRequest: %s\n", out_msg);
+              DPRINTF(ProtocolTrace, "issueLoadRequest: addr: %#x, s: %s, d: %d, attack: %d, req_enqueu: %d\n",
+                      address, machineID, mapAddressToL1Cache(address), out_msg.attackMessage, out_msg.req_enqueue_time);
+          }
+      }
+  }
+
+  action(issueStoreRequest, "s", desc="") {
+    enqueue(requestOut_out, RequestMsg, issue_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:ST;
+      out_msg.Requestor := machineID;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:L1Cache));
+      out_msg.MessageSize := MessageSizeType:Control;
+    }
+  }
+  
+  action(issueLoadResponse, "ilr", desc="") {
+    peek(requestIn_in, RequestMsg) {
+      enqueue(responseOut_out, ResponseMsg, issue_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.attackMessage := in_msg.attackMessage;
+        out_msg.req_enqueue_time := in_msg.req_enqueue_time;
+        DPRINTF(Vanilla, "issueLoadResponse: %s\n", out_msg);
+
+        DPRINTF(ProtocolTrace, "issueLoadResponse %#x, s:%s d:%d, attack(%d,%d), req_enque(%d,%d)\n",
+                address, machineID, in_msg.Requestor, in_msg.attackMessage,
+                out_msg.attackMessage, in_msg.req_enqueue_time, out_msg.req_enqueue_time);
+      }
+    }
+  }
+
+  action(m_popMandatoryQueue, "m", desc="Pop the mandatory request queue") {
+    mandatoryQueue_in.dequeue(clockEdge());
+  }
+  
+  action(popRequestInQueue, "priq", desc="") {
+    requestIn_in.dequeue(clockEdge());
+  }
+  
+  action(popResponseInQueue, "preiq", desc="") {
+    responseIn_in.dequeue(clockEdge());
+  }
+
+  action(r_load_hit, "rlh", desc="Notify sequencer the load completed.") {
+    sequencer.readCallback(address, false, dummyData);
+  }
+
+  action(s_store_hit, "slh", desc="Notify sequencer that store completed.") {
+    sequencer.writeCallback(address, dummyData);
+  }
+
+
+  // TRANSITIONS
+
+  // sequencer hit call back is performed after injecting the packets.
+  // The goal of the Garnet_standalone protocol is only to inject packets into
+  // the network, not to keep track of them via TBEs.
+  transition(I, LoadRequest) {
+    r_load_hit;
+    issueLoadRequest;
+    m_popMandatoryQueue;
+  }
+
+  transition(I, StoreRequest) {
+    s_store_hit;
+    issueStoreRequest;
+    m_popMandatoryQueue;
+  }
+  
+  transition(I, LoadRequestArrived) {
+    issueLoadResponse;
+    popRequestInQueue;
+  }
+
+  transition(I, StoreRequestArrived) {
+    popRequestInQueue;
+  }
+
+  transition(I, LoadResponseArrived) {
+    popResponseInQueue;
+  }
+  
+}
